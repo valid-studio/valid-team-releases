@@ -1,0 +1,163 @@
+name: Ephemeral Windows Package & Selftest (v1.2.19)
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft_id:
+        required: true
+        type: string
+      bundle_asset_id:
+        required: true
+        type: string
+      app_version:
+        required: true
+        type: string
+      build_number:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download Cross-Compiled Bundle, Selftest, Package Setup & Upload to Draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRAFT_ID: ${{ inputs.draft_id }}
+          BUNDLE_ASSET_ID: ${{ inputs.bundle_asset_id }}
+          APP_VERSION: ${{ inputs.app_version }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+          $work = Join-Path $env:RUNNER_TEMP "winpkg"
+          $outDir = Join-Path $work "out"
+          New-Item -ItemType Directory -Force -Path $work, $outDir | Out-Null
+
+          $bundlePath = Join-Path $work "win-stage.tar.gz"
+          $assetApi = "https://api.github.com/repos/$env:REPO/releases/assets/$env:BUNDLE_ASSET_ID"
+          Write-Host "==> Downloading bundle asset $env:BUNDLE_ASSET_ID..."
+          & curl.exe --http1.1 -fsSL -L `
+            -H "Authorization: Bearer $env:GH_TOKEN" `
+            -H "Accept: application/octet-stream" `
+            -o $bundlePath $assetApi
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download bundle asset" }
+
+          & tar.exe -xzf $bundlePath -C $work
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract bundle" }
+
+          $stageDir = Join-Path $work "ValidTeam"
+          $vteamExe = Join-Path $stageDir "vteam.exe"
+          $guiExe = Join-Path $stageDir "ValidTeam.exe"
+
+          Write-Host "==> Verifying vteam.exe --version..."
+          $verOut = (& $vteamExe --version 2>&1 | Out-String).Trim()
+          Write-Host "vteam.exe --version => $verOut"
+          if ($LASTEXITCODE -ne 0) { throw "vteam.exe --version failed" }
+          if ($verOut -notmatch [regex]::Escape($env:APP_VERSION)) {
+            throw "vteam.exe version mismatch: expected $env:APP_VERSION, got $verOut"
+          }
+
+          Write-Host "==> Running ValidTeam.exe --ci-selftest..."
+          $selfOut = (& $guiExe --ci-selftest 2>&1 | Out-String).Trim()
+          Write-Host $selfOut
+          if ($LASTEXITCODE -ne 0) { throw "ValidTeam.exe --ci-selftest exited $LASTEXITCODE" }
+          if ($selfOut -notmatch "WIN_GUI_SELFTEST_OK") { throw "Missing WIN_GUI_SELFTEST_OK marker" }
+          Start-Sleep -Milliseconds 500
+          $leftover = Get-Process -Name "ValidTeam","vteam" -ErrorAction SilentlyContinue
+          if ($leftover) {
+            throw "Residual processes detected after selftest: $($leftover | ForEach-Object { $_.Name + ':' + $_.Id })"
+          }
+          Write-Host "✅ Selftest passed with 0 residual processes."
+
+          Write-Host "==> Creating ValidTeam-windows-amd64.zip..."
+          $zipPath = Join-Path $outDir "ValidTeam-windows-amd64.zip"
+          Compress-Archive -Path $stageDir -DestinationPath $zipPath -Force
+
+          Write-Host "==> Compiling ValidTeam-Setup.exe via Inno Setup..."
+          $isccPath = $null
+          foreach ($cand in @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+            "C:\ProgramData\chocolatey\bin\ISCC.exe"
+          )) {
+            if ($cand -and (Test-Path -LiteralPath $cand)) { $isccPath = $cand; break }
+          }
+          if (-not $isccPath) {
+            & choco install innosetup -y --no-progress | Out-Null
+            foreach ($cand in @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+            )) {
+              if (Test-Path -LiteralPath $cand) { $isccPath = $cand; break }
+            }
+          }
+          if (-not $isccPath) { throw "ISCC.exe not found" }
+
+          $issFile = Join-Path $work "installer.iss"
+          & $isccPath "/DMyAppVersion=$env:APP_VERSION" "/DMyBuildNumber=$env:BUILD_NUMBER" "/DSourceDir=$stageDir" "/DOutputDir=$outDir" $issFile
+          if ($LASTEXITCODE -ne 0) { throw "ISCC.exe failed ($LASTEXITCODE)" }
+
+          $setupPath = Join-Path $outDir "ValidTeam-Setup.exe"
+          if (-not (Test-Path -LiteralPath $setupPath)) { throw "ValidTeam-Setup.exe missing" }
+
+          $setupHash = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $setupSize = (Get-Item -LiteralPath $setupPath).Length
+          $zipSize = (Get-Item -LiteralPath $zipPath).Length
+
+          $sums = @(
+            "$setupHash  ValidTeam-Setup.exe",
+            "$zipHash  ValidTeam-windows-amd64.zip"
+          ) -join "`n"
+          $sumsPath = Join-Path $outDir "SHA256SUMS-windows.txt"
+          [System.IO.File]::WriteAllText($sumsPath, ($sums + "`n"), [System.Text.UTF8Encoding]::new($false))
+
+          $notesText = [System.IO.File]::ReadAllText((Join-Path $work "ota_notes.md"), [System.Text.UTF8Encoding]::new($false)).Trim()
+          $pubDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $releaseTag = "v$env:APP_VERSION"
+          $manifestObj = [ordered]@{
+            version      = $env:APP_VERSION
+            build        = $env:BUILD_NUMBER
+            tag          = $releaseTag
+            pub_date     = $pubDate
+            published_at = $pubDate
+            zip_name     = "ValidTeam-windows-amd64.zip"
+            zip_url      = "https://github.com/$env:REPO/releases/download/$releaseTag/ValidTeam-windows-amd64.zip"
+            zip_sha256   = $zipHash
+            zip_size     = [int64]$zipSize
+            setup_name   = "ValidTeam-Setup.exe"
+            setup_url    = "https://github.com/$env:REPO/releases/download/$releaseTag/ValidTeam-Setup.exe"
+            setup_sha256 = $setupHash
+            setup_size   = [int64]$setupSize
+            sha256       = $zipHash
+            notes        = $notesText
+          }
+          $manifestPath = Join-Path $outDir "latest-windows.json"
+          $manifestJson = ($manifestObj | ConvertTo-Json -Depth 4) + "`n"
+          [System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.UTF8Encoding]::new($false))
+
+          Write-Host "==> Uploading 4 Windows release assets back to Draft ID $env:DRAFT_ID..."
+          $uploadBase = "https://uploads.github.com/repos/$env:REPO/releases/$env:DRAFT_ID/assets"
+          foreach ($item in @(
+            @{ Path = $setupPath;    Name = "ValidTeam-Setup.exe";         CT = "application/octet-stream" },
+            @{ Path = $zipPath;      Name = "ValidTeam-windows-amd64.zip"; CT = "application/zip" },
+            @{ Path = $sumsPath;     Name = "SHA256SUMS-windows.txt";      CT = "text/plain" },
+            @{ Path = $manifestPath; Name = "latest-windows.json";         CT = "application/json" }
+          )) {
+            & curl.exe --http1.1 -fsSL -X POST `
+              -H "Authorization: Bearer $env:GH_TOKEN" `
+              -H "Content-Type: $($item.CT)" `
+              --data-binary "@$($item.Path)" `
+              "${uploadBase}?name=$($item.Name)" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Failed uploading $($item.Name)" }
+            Write-Host "  Uploaded $($item.Name)"
+          }
+          Write-Host "✅ Windows packaging & selftest complete."
