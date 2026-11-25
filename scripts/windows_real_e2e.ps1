@@ -3,7 +3,9 @@
 param(
   [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\ValidTeam"),
   [string]$DownloadDir = (Join-Path $env:RUNNER_TEMP "vt-win"),
-  [string]$PortableDir = ""
+  [string]$PortableDir = "",
+  [string]$ReleaseRepo = "",
+  [string]$TargetTag = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,10 +98,332 @@ function Assert-ZipExport([string]$Url, [string]$OutZip, [string]$Label) {
   return (Get-Item -LiteralPath $OutZip).Length
 }
 
-Write-Host "==> [Win-E2E 1/6] Running stripped native Windows Go unit test binaries (if staged in release)..."
-foreach ($testBin in @("core-platform.test.exe", "vteam-statedb.test.exe", "windows-app.test.exe", "va-sdk.test.exe")) {
+function Find-UsablePython {
+  foreach ($cand in @("python", "py", "python3")) {
+    $cmd = Get-Command $cand -ErrorAction SilentlyContinue
+    if ($cmd -and ($cmd.Source -notlike "*WindowsApps*")) {
+      return $cmd.Source
+    }
+  }
+  throw "No usable Python interpreter found for Clean-VM OTA HTTP gate & SQLite integrity verification"
+}
+
+function Invoke-CleanPy([string]$PyExe, [string[]]$PyArgs) {
+  if ([System.IO.Path]::GetFileNameWithoutExtension($PyExe) -eq "py") {
+    $fullArgs = @("-3") + $PyArgs
+    return & $PyExe @fullArgs
+  }
+  return & $PyExe @PyArgs
+}
+
+function Stop-CleanWinOTAProcesses {
+  foreach ($n in @("ValidTeam", "vteam")) {
+    Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  }
+  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like "vt-updater-*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 600
+}
+
+function Invoke-CleanWinCliCapture([string]$ExePath, [string[]]$CliArgs, [string]$Tag) {
+  $oFile = Join-Path $env:RUNNER_TEMP "vt-clean-cli-$Tag.out.txt"
+  $eFile = Join-Path $env:RUNNER_TEMP "vt-clean-cli-$Tag.err.txt"
+  Remove-Item -LiteralPath $oFile, $eFile -Force -ErrorAction SilentlyContinue
+  $p = Start-Process -FilePath $ExePath -ArgumentList $CliArgs -PassThru -RedirectStandardOutput $oFile -RedirectStandardError $eFile
+  if (-not $p.WaitForExit(30000)) {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    throw "CLI timed out: $ExePath $($CliArgs -join ' ')"
+  }
+  $p.WaitForExit()
+  return [pscustomobject]@{
+    ExitCode = $p.ExitCode
+    Stdout   = [string](Get-Content -LiteralPath $oFile -Raw -ErrorAction SilentlyContinue)
+  }
+}
+
+function Test-SemverAtLeast([string]$Ver, [int]$Major, [int]$Minor, [int]$Patch) {
+  $core = ($Ver.Trim().TrimStart("v", "V") -split "[-+]")[0]
+  $nums = @([regex]::Matches($core, "\d+") | ForEach-Object { [int]$_.Value })
+  while ($nums.Count -lt 3) { $nums += 0 }
+  if ($nums[0] -ne $Major) { return $nums[0] -gt $Major }
+  if ($nums[1] -ne $Minor) { return $nums[1] -gt $Minor }
+  return $nums[2] -ge $Patch
+}
+
+function Wait-CleanOtaStatus([string]$ExpectedVer, [string]$ExpectedBuild = "", [int]$TimeoutSec = 45) {
+  $dl = (Get-Date).AddSeconds($TimeoutSec)
+  while ((Get-Date) -lt $dl) {
+    try {
+      $st = Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/status" -TimeoutSec 2
+      $v = ([string]$st.version).TrimStart("v", "V").Trim()
+      $b = ([string]$st.build).Trim()
+      if (($st.ok -eq $true) -and (-not $st.bootstrapping) -and ($v -eq $ExpectedVer) -and ([string]::IsNullOrEmpty($ExpectedBuild) -or ($b -eq $ExpectedBuild))) {
+        return $st
+      }
+    } catch {}
+    Start-Sleep -Milliseconds 400
+  }
+  return $null
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ReleaseRepo) -and -not [string]::IsNullOrWhiteSpace($TargetTag)) {
+  Write-Host "==> [Win-E2E 0/6] Real Clean-VM Live OTA Upgrade (PREV_TAG != $TargetTag -> $TargetTag)..."
+  $targetManifestPath = Join-Path $DownloadDir "latest-windows.json"
+  $targetZipPath = Join-Path $DownloadDir "ValidTeam-windows-amd64.zip"
+  $targetSetupPath = Join-Path $DownloadDir "ValidTeam-Setup.exe"
+  if (-not (Test-Path -LiteralPath $targetManifestPath) -or -not (Test-Path -LiteralPath $targetZipPath)) {
+    throw "Missing target release assets under $DownloadDir"
+  }
+  $tManifest = Get-Content -LiteralPath $targetManifestPath -Raw | ConvertFrom-Json
+  $targetVer = ([string]$tManifest.version).TrimStart("v", "V").Trim()
+  $targetBuild = ([string]$tManifest.build).Trim()
+  $resolvedTargetTag = if ($TargetTag -eq "latest") { "v$targetVer" } else { $TargetTag.Trim() }
+
+  $relListRaw = & gh release list -R $ReleaseRepo --exclude-drafts --exclude-pre-releases --limit 20 --json tagName | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "gh release list failed for $ReleaseRepo" }
+  $relItems = @($relListRaw | ConvertFrom-Json)
+  $prevTagObj = $relItems | Where-Object { ([string]$_.tagName).Trim() -ne "" -and ([string]$_.tagName).Trim() -ne $resolvedTargetTag } | Select-Object -First 1
+  if (-not $prevTagObj) {
+    throw "No previous stable release found with tagName != $resolvedTargetTag in $ReleaseRepo"
+  }
+  $prevTag = ([string]$prevTagObj.tagName).Trim()
+  $prevVer = $prevTag.TrimStart("v", "V")
+  $isPrevGte130 = Test-SemverAtLeast $prevVer 1 3 0
+  Write-Host "    Resolved PREV_TAG=$prevTag -> TARGET_TAG=$resolvedTargetTag (v$targetVer, build=$targetBuild, prev>=1.3.0=$isPrevGte130)"
+
+  $otaWork = Join-Path $env:RUNNER_TEMP ("vt-win-clean-ota-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+  $prevDlDir = Join-Path $otaWork "prev-dl"
+  $prevAppRoot = Join-Path $otaWork "prev-app-中文"
+  $otaSrvDir = Join-Path $otaWork "srv"
+  $otaCacheDir = Join-Path $otaWork "cache"
+  $gateScript = Join-Path $otaSrvDir "ota_gate.py"
+  $gateFlag = Join-Path $otaSrvDir "allow_ota.flag"
+  $hitLog = Join-Path $otaSrvDir "hits.log"
+  $vtDataRoot = Join-Path $env:LOCALAPPDATA "ValidTeam"
+  $otaSecToml = Join-Path $vtDataRoot "security.toml"
+  $otaProjName = "OTA保留验证"
+  $otaProjEnc = [uri]::EscapeDataString($otaProjName)
+  $otaProjDir = Join-Path (Join-Path $vtDataRoot "Projects") $otaProjName
+  $otaProjToml = Join-Path $otaProjDir "project.toml"
+  $otaProjDb = Join-Path $otaProjDir "state.db"
+
+  $pyExe = Find-UsablePython
+  $script:cleanOtaHttp = $null
+  $hadPreExistingSecToml = Test-Path -LiteralPath $otaSecToml
+  $savedM = $env:VTEAM_WIN_OTA_MANIFEST_URL
+  $savedA = $env:VTEAM_WIN_OTA_AUTO_CONFIRM
+  $savedH = $env:VTEAM_HEADLESS_TEST
+  $savedC = $env:VTEAM_WIN_OTA_CACHE_DIR
+  $savedB = $env:VALID_TEAM_SECRET_BACKEND
+
+  try {
+    Stop-CleanWinOTAProcesses
+    New-Item -ItemType Directory -Force -Path $prevDlDir, $prevAppRoot, $otaSrvDir, $otaCacheDir, $vtDataRoot | Out-Null
+    & gh release download $prevTag -R $ReleaseRepo -p "ValidTeam-windows-amd64.zip" -D $prevDlDir --clobber
+    if ($LASTEXITCODE -ne 0) { throw "Failed to download $prevTag ValidTeam-windows-amd64.zip" }
+    Expand-Archive -LiteralPath (Join-Path $prevDlDir "ValidTeam-windows-amd64.zip") -DestinationPath $prevAppRoot -Force
+    $prevGuiExe = (Get-ChildItem -Path $prevAppRoot -Filter "ValidTeam.exe" -Recurse | Select-Object -First 1).FullName
+    if (-not $prevGuiExe) { throw "Missing ValidTeam.exe in $prevTag archive" }
+    $prevInstallDir = Split-Path -Parent $prevGuiExe
+    $prevVteamExe = Join-Path $prevInstallDir "vteam.exe"
+
+    Copy-Item -LiteralPath $targetZipPath -Destination (Join-Path $otaSrvDir "ValidTeam-windows-amd64.zip") -Force
+    Copy-Item -LiteralPath $targetZipPath -Destination (Join-Path $otaSrvDir "tampered-windows-amd64.zip") -Force
+    if (Test-Path -LiteralPath $targetSetupPath) {
+      Copy-Item -LiteralPath $targetSetupPath -Destination (Join-Path $otaSrvDir "ValidTeam-Setup.exe") -Force
+      Copy-Item -LiteralPath $targetSetupPath -Destination (Join-Path $otaSrvDir "tampered-Setup.exe") -Force
+    }
+    $flipCode = 'import sys; p=sys.argv[1]; f=open(p,"r+b"); f.seek(-1,2); b=f.read(1); f.seek(-1,2); f.write(bytes([b[0]^0xFF])); f.close()'
+    Invoke-CleanPy $pyExe @("-c", $flipCode, (Join-Path $otaSrvDir "tampered-windows-amd64.zip")) | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to tamper bad zip" }
+
+    $otaPort = Get-FreeLoopbackPort
+    $goodM = $tManifest | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+    $goodM.zip_url = "http://127.0.0.1:$otaPort/ValidTeam-windows-amd64.zip"
+    $goodM.setup_url = "http://127.0.0.1:$otaPort/ValidTeam-Setup.exe"
+    Write-Utf8NoBom (Join-Path $otaSrvDir "latest-windows.json") (($goodM | ConvertTo-Json -Depth 4) + "`n")
+    $badM = $goodM | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+    $badM.zip_url = "http://127.0.0.1:$otaPort/tampered-windows-amd64.zip"
+    $badM.setup_url = "http://127.0.0.1:$otaPort/tampered-Setup.exe"
+    Write-Utf8NoBom (Join-Path $otaSrvDir "bad-latest-windows.json") (($badM | ConvertTo-Json -Depth 4) + "`n")
+
+    $gateCode = @'
+import argparse, http.server, os, socketserver, time
+p = argparse.ArgumentParser()
+p.add_argument("--dir", required=True); p.add_argument("--port", type=int, required=True)
+p.add_argument("--mode", required=True); p.add_argument("--flag", required=True)
+p.add_argument("--hit-log", required=True)
+a = p.parse_args()
+def log(m):
+    with open(a.hit_log, "a", encoding="utf-8") as f: f.write(m + "\n"); f.flush()
+class H(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *x, **kw): super().__init__(*x, directory=a.dir, **kw)
+    def log_message(self, *x): pass
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/latest-windows.json" and a.mode == "gated":
+            log("MANIFEST_WAITING")
+            dl = time.monotonic() + 25.0
+            while not os.path.exists(a.flag):
+                if time.monotonic() >= dl: self.send_error(503); return
+                time.sleep(0.05)
+            log("MANIFEST_RELEASED")
+        elif path == "/tampered-windows-amd64.zip": log("BAD_ASSET_SERVED")
+        elif path == "/ValidTeam-windows-amd64.zip": log("GOOD_ASSET_SERVED")
+        super().do_GET()
+class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    allow_reuse_address = True; daemon_threads = True
+S(("127.0.0.1", a.port), H).serve_forever()
+'@
+    Write-Utf8NoBom $gateScript $gateCode
+
+    $secPlaceholder = "default_model = `"selftest/mock`"`n`n[[api]]`nname = `"selftest`"`nformat = `"openai`"`nbase_url = `"http://127.0.0.1:9/v1`"`nkey = `"sk-ci-unit-test-placeholder`"`nmodels = [`"mock`"]`n"
+    Write-Utf8NoBom $otaSecToml $secPlaceholder
+    $secHashPre = (Get-FileHash -LiteralPath $otaSecToml -Algorithm SHA256).Hash
+    if (Test-Path -LiteralPath $otaProjDir) { Remove-Item -LiteralPath $otaProjDir -Recurse -Force }
+
+    $startGate = {
+      param([string]$mode)
+      if ($script:cleanOtaHttp -and -not $script:cleanOtaHttp.HasExited) {
+        Stop-Process -Id $script:cleanOtaHttp.Id -Force -ErrorAction SilentlyContinue
+        $script:cleanOtaHttp.WaitForExit(3000) | Out-Null
+      }
+      Write-Utf8NoBom $hitLog ""
+      $pref = if ([System.IO.Path]::GetFileNameWithoutExtension($pyExe) -eq "py") { "-3 " } else { "" }
+      $psi = [System.Diagnostics.ProcessStartInfo]::new()
+      $psi.FileName = $pyExe
+      $psi.Arguments = "${pref}`"$gateScript`" --dir `"$otaSrvDir`" --port $otaPort --mode $mode --flag `"$gateFlag`" --hit-log `"$hitLog`""
+      $psi.WorkingDirectory = $otaSrvDir; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+      $script:cleanOtaHttp = [System.Diagnostics.Process]::Start($psi)
+      for ($i = 0; $i -lt 30; $i++) {
+        try { if ((Invoke-WebRequest -Uri "http://127.0.0.1:$otaPort/bad-latest-windows.json" -TimeoutSec 2 -UseBasicParsing).StatusCode -eq 200) { return } } catch {}
+        Start-Sleep -Milliseconds 150
+      }
+      throw "Clean-VM OTA HTTP gate failed to start"
+    }
+
+    # Phase 1: Negative tampered rejection + seed OTA保留验证 project
+    & $startGate "bad"
+    $env:VALID_TEAM_SECRET_BACKEND = "memory"
+    $env:VTEAM_WIN_OTA_CACHE_DIR = $otaCacheDir
+    $env:VTEAM_WIN_OTA_MANIFEST_URL = "http://127.0.0.1:$otaPort/bad-latest-windows.json"
+    $env:VTEAM_WIN_OTA_AUTO_CONFIRM = "1"
+    $env:VTEAM_HEADLESS_TEST = "1"
+
+    $g1 = Start-Process -FilePath $prevGuiExe -WorkingDirectory $prevInstallDir -PassThru
+    if (-not (Wait-CleanOtaStatus -ExpectedVer $prevVer -TimeoutSec 45)) { throw "Clean-VM OTA Phase 1 $prevTag failed to come online" }
+    $d1 = Get-Process -Name "vteam" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $d1) { throw "Clean-VM OTA Phase 1 missing vteam.exe" }
+
+    $otaHdr = Join-Path $otaWork "proj.hdr"
+    curl.exe -fsS -D "$otaHdr" -o NUL -X POST "http://127.0.0.1:8787/projects" -d "name=$otaProjEnc"
+    if ($LASTEXITCODE -ne 0 -or ((Get-Content -LiteralPath $otaHdr -Raw) -notmatch "(?m)^HTTP/\S+[ \t]+303\b")) {
+      throw "Clean-VM OTA Phase 1 failed to create $otaProjName project"
+    }
+    if (-not (Test-Path -LiteralPath $otaProjToml) -or -not (Test-Path -LiteralPath $otaProjDb)) {
+      throw "Clean-VM OTA Phase 1 missing $otaProjToml or $otaProjDb"
+    }
+    $projHashPre = (Get-FileHash -LiteralPath $otaProjToml -Algorithm SHA256).Hash
+
+    $errLog = Join-Path $otaCacheDir "last-update-error.log"
+    $rejOk = $false
+    if ($isPrevGte130) {
+      for ($i = 0; $i -lt 60; $i++) {
+        $hTxt = Get-Content -LiteralPath $hitLog -Raw -ErrorAction SilentlyContinue
+        if ($hTxt -match "BAD_ASSET_SERVED" -and (Test-Path -LiteralPath $errLog) -and ((Get-Item -LiteralPath $errLog).Length -gt 0)) { $rejOk = $true; break }
+        Start-Sleep -Milliseconds 500
+      }
+      if (-not $rejOk) { throw "Clean-VM OTA Phase 1 did not record tampered rejection (BAD_ASSET_SERVED + last-update-error.log)" }
+    } else {
+      Write-Host "    [TRANSITION-v1.3.0] Previous stable $prevTag (< v1.3.0) predates stage-failure last-update-error.log; verifying live tampered rejection & zero staged artifacts..."
+      for ($i = 0; $i -lt 60; $i++) {
+        $hTxt = Get-Content -LiteralPath $hitLog -Raw -ErrorAction SilentlyContinue
+        if ($hTxt -match "BAD_ASSET_SERVED") { $rejOk = $true; break }
+        Start-Sleep -Milliseconds 500
+      }
+      if (-not $rejOk) { throw "Clean-VM OTA Phase 1 did not observe BAD_ASSET_SERVED for $prevTag" }
+      Start-Sleep -Seconds 4
+    }
+    if (Get-ChildItem -Path $otaCacheDir -Filter "*.part" -Recurse -ErrorAction SilentlyContinue) { throw "Clean-VM OTA Phase 1 left .part files" }
+    $badStageFiles = Get-ChildItem -Path $otaCacheDir -Include "ready.json", "last-applied.json", "vt-updater-*.exe" -Recurse -ErrorAction SilentlyContinue
+    if ($badStageFiles) { throw "Clean-VM OTA Phase 1 left staged/updater artifacts after tampered rejection: $($badStageFiles.FullName -join ', ')" }
+    $badUpdProcs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like "vt-updater-*" }
+    if ($badUpdProcs) { throw "Clean-VM OTA Phase 1 unexpectedly spawned vt-updater-* after tampered rejection" }
+    if (-not (Get-Process -Id $g1.Id -ErrorAction SilentlyContinue) -or -not (Get-Process -Id $d1.Id -ErrorAction SilentlyContinue)) {
+      throw "Clean-VM OTA Phase 1 baseline PIDs died after rejection"
+    }
+    if (-not (Wait-CleanOtaStatus -ExpectedVer $prevVer -TimeoutSec 5)) {
+      throw "Clean-VM OTA Phase 1 /api/status drifted from v$prevVer after tampered rejection"
+    }
+    Stop-CleanWinOTAProcesses
+
+    # Phase 2: Gated positive PREV_TAG -> TARGET_TAG transition + 4 hard assertions
+    Remove-Item -LiteralPath $gateFlag, $errLog -Force -ErrorAction SilentlyContinue
+    & $startGate "gated"
+    $env:VTEAM_WIN_OTA_MANIFEST_URL = "http://127.0.0.1:$otaPort/latest-windows.json"
+    $g2 = Start-Process -FilePath $prevGuiExe -WorkingDirectory $prevInstallDir -PassThru
+    if (-not (Wait-CleanOtaStatus -ExpectedVer $prevVer -TimeoutSec 45)) { throw "Clean-VM OTA Phase 2 $prevTag failed to come online" }
+    $d2 = Get-Process -Name "vteam" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $d2) { throw "Clean-VM OTA Phase 2 missing baseline vteam.exe" }
+    $oldG = $g2.Id; $oldD = $d2.Id
+    Write-Utf8NoBom $gateFlag "go`n"
+
+    if (-not (Wait-CleanOtaStatus -ExpectedVer $targetVer -ExpectedBuild $targetBuild -TimeoutSec 90)) {
+      throw "Clean-VM OTA Phase 2 did not upgrade /api/status to v$targetVer ($targetBuild) within 90s"
+    }
+    $gVer = Invoke-CleanWinCliCapture $prevGuiExe @("--version") "clean-gui-after"
+    $vVer = Invoke-CleanWinCliCapture $prevVteamExe @("--version") "clean-vteam-after"
+    if ($gVer.ExitCode -ne 0 -or $gVer.Stdout -notmatch [regex]::Escape("v$targetVer")) { throw "Clean-VM OTA Assertion 1 failed: ValidTeam.exe=$($gVer.Stdout)" }
+    if ($vVer.ExitCode -ne 0 -or $vVer.Stdout -notmatch [regex]::Escape("v$targetVer")) { throw "Clean-VM OTA Assertion 1 failed: vteam.exe=$($vVer.Stdout)" }
+    if ((Get-ChildItem -Path $prevInstallDir -Filter "*.old" -ErrorAction SilentlyContinue) -or (Get-ChildItem -Path $otaCacheDir -Filter "*.part" -Recurse -ErrorAction SilentlyContinue)) {
+      throw "Clean-VM OTA Assertion 1 failed: leftover .old/.part files"
+    }
+
+    for ($w = 0; $w -lt 20; $w++) {
+      if (-not (Get-Process -Id $oldG -ErrorAction SilentlyContinue) -and -not (Get-Process -Id $oldD -ErrorAction SilentlyContinue)) { break }
+      Start-Sleep -Milliseconds 300
+    }
+    if ((Get-Process -Id $oldG -ErrorAction SilentlyContinue) -or (Get-Process -Id $oldD -ErrorAction SilentlyContinue)) {
+      throw "Clean-VM OTA Assertion 3 failed: old PIDs survived ($oldG / $oldD)"
+    }
+    $newDs = @(Get-Process -Name "vteam" -ErrorAction SilentlyContinue)
+    $newGs = @(Get-Process -Name "ValidTeam" -ErrorAction SilentlyContinue)
+    if ($newDs.Count -ne 1 -or $newDs[0].Id -eq $oldD -or ($newGs | Where-Object { $_.Id -ne $oldG }).Count -lt 1) {
+      throw "Clean-VM OTA Assertion 2/3 failed: invalid upgraded process state"
+    }
+    if ((Get-FileHash -LiteralPath $otaSecToml -Algorithm SHA256).Hash -ne $secHashPre) { throw "Clean-VM OTA Assertion 4 failed: security.toml altered" }
+    if ((Get-FileHash -LiteralPath $otaProjToml -Algorithm SHA256).Hash -ne $projHashPre) { throw "Clean-VM OTA Assertion 4 failed: project.toml altered" }
+    if ((curl.exe -sS -o NUL -w "%{http_code}" "http://127.0.0.1:8787/projects/$otaProjEnc").Trim() -ne "200") {
+      throw "Clean-VM OTA Assertion 4 failed: GET /projects/$otaProjEnc != 200"
+    }
+    $sqlCode = 'import sqlite3, sys; c=sqlite3.connect(sys.argv[1], timeout=15); c.execute("PRAGMA busy_timeout=15000"); r=c.execute("PRAGMA integrity_check").fetchone()[0]; c.close(); print(r); sys.exit(0 if r=="ok" else 1)'
+    $sqlRes = (Invoke-CleanPy $pyExe @("-c", $sqlCode, $otaProjDb) | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $sqlRes -ne "ok") { throw "Clean-VM OTA Assertion 4 failed: sqlite integrity_check='$sqlRes'" }
+
+    Write-Host "WIN_CLEAN_OTA_E2E_OK from=$prevTag to=$targetVer"
+  } finally {
+    Stop-CleanWinOTAProcesses
+    if ($script:cleanOtaHttp -and -not $script:cleanOtaHttp.HasExited) { Stop-Process -Id $script:cleanOtaHttp.Id -Force -ErrorAction SilentlyContinue }
+    $env:VTEAM_WIN_OTA_MANIFEST_URL = $savedM
+    $env:VTEAM_WIN_OTA_AUTO_CONFIRM = $savedA
+    $env:VTEAM_HEADLESS_TEST = $savedH
+    $env:VTEAM_WIN_OTA_CACHE_DIR = $savedC
+    $env:VALID_TEAM_SECRET_BACKEND = $savedB
+    if (-not $hadPreExistingSecToml) {
+      Remove-Item -LiteralPath $otaSecToml -Force -ErrorAction SilentlyContinue
+    }
+    Remove-DirectoryWithRetry $otaProjDir 8
+    Remove-DirectoryWithRetry $otaWork 8
+  }
+}
+
+Write-Host "==> [Win-E2E 1/6] Running stripped native Windows Go unit test binaries..."
+$requireWinTestBins = ($env:VTEAM_REQUIRE_WIN_TEST_BINS -eq "1") -or (@(Get-ChildItem -Path $DownloadDir -Filter "*.test.exe" -ErrorAction SilentlyContinue).Count -gt 0)
+foreach ($testBin in @("core-platform.test.exe", "vteam-statedb.test.exe", "windows-app.test.exe", "va-sdk.test.exe", "va-llm.test.exe")) {
   $binPath = Join-Path $DownloadDir $testBin
   if (Test-Path -LiteralPath $binPath) {
+    if ((Get-Item -LiteralPath $binPath).Length -le 0) {
+      throw "Required native Windows unit test binary is empty (0 bytes): $binPath"
+    }
     Write-Host "   -> Executing $testBin on real Windows NTFS (clean empty workdir)..."
     $tWork = Join-Path $env:RUNNER_TEMP ("ut-" + $testBin)
     if (Test-Path -LiteralPath $tWork) { Remove-Item -LiteralPath $tWork -Recurse -Force }
@@ -113,6 +437,8 @@ foreach ($testBin in @("core-platform.test.exe", "vteam-statedb.test.exe", "wind
       Pop-Location
       Remove-Item -LiteralPath $tWork -Recurse -Force -ErrorAction SilentlyContinue
     }
+  } elseif ($requireWinTestBins) {
+    throw "Required native Windows unit test binary missing: $binPath"
   }
 }
 
@@ -215,6 +541,106 @@ try {
       $safeHdr = if (Test-Path -LiteralPath $setupHdr) { (Get-Content -LiteralPath $setupHdr -Raw).Replace($env:VTEAM_TEST_API_KEY, "[REDACTED]") } else { "<no headers>" }
       throw "POST /setup failed after 4 attempts ($apiName/$apiModel): $safeHdr"
     }
+  }
+
+  # Stage 3.8/6: Cross-OS Env & Path Real Windows Assertions (CODEX_HOME Chinese+Space & Non-PATH agy & Zero Unix which/Duplicate Copy)
+  Write-Host "==> [Win-E2E 3.8/6] Verifying CODEX_HOME (Chinese+Space, absent ~/.codex), non-PATH agy detection & Windows CLI hint copy..."
+  $envE2ERoot = Join-Path $env:RUNNER_TEMP "Valid Team 环境变量验证"
+  $envFakeHome = Join-Path $envE2ERoot "fake-home"
+  $envCodexHome = Join-Path $envE2ERoot "自定义 codex 目录 中文空格"
+  $envNonPathBin = Join-Path $envE2ERoot "非默认PATH工具目录"
+  $envWorkRoot = Join-Path $envE2ERoot "ws"
+  $envSecFile = Join-Path $envE2ERoot "security.toml"
+  $envOutLog = Join-Path $env:RUNNER_TEMP "win-e2e-env-out.log"
+  $envErrLog = Join-Path $env:RUNNER_TEMP "win-e2e-env-err.log"
+  $envDaemon = $null
+  $savedEnvMap = @{}
+  $envKeysToSave = @("USERPROFILE", "HOME", "CODEX_HOME", "CODEX_CLI_AUTH_FILE", "XDG_BIN_HOME", "AGY_HOME", "GEMINI_CLI_HOME", "AGY_TOKEN_FILE", "AGY_TOKEN_BLOB", "VALID_TEAM_SECRET_BACKEND", "VTEAM_DISABLE_HOST_ENV_REFRESH")
+  foreach ($ek in $envKeysToSave) {
+    $savedEnvMap[$ek] = [Environment]::GetEnvironmentVariable($ek, "Process")
+  }
+  try {
+    if (Test-Path -LiteralPath $envE2ERoot) { Remove-DirectoryWithRetry $envE2ERoot 10 }
+    New-Item -ItemType Directory -Force -Path $envFakeHome, $envCodexHome, $envNonPathBin, $envWorkRoot | Out-Null
+    $defaultCodexInFakeHome = Join-Path $envFakeHome ".codex"
+    if (Test-Path -LiteralPath $defaultCodexInFakeHome) { throw "Unexpected default .codex in isolated fake home: $defaultCodexInFakeHome" }
+
+    Write-Utf8NoBom (Join-Path $envCodexHome "auth.json") '{"auth_mode":"chatgpt","tokens":{"access_token":"dummy-win-e2e-codex-token"}}'
+    Write-Utf8NoBom (Join-Path $envNonPathBin "codex.cmd") "@echo off`r`nexit /b 0`r`n"
+    Write-Utf8NoBom (Join-Path $envNonPathBin "agy.cmd") "@echo off`r`nexit /b 0`r`n"
+    Write-Utf8NoBom $envSecFile $secToml
+
+    $env:USERPROFILE = $envFakeHome
+    $env:HOME = $envFakeHome
+    $env:CODEX_HOME = $envCodexHome
+    $env:CODEX_CLI_AUTH_FILE = ""
+    $env:XDG_BIN_HOME = $envNonPathBin
+    $env:AGY_HOME = ""
+    $env:GEMINI_CLI_HOME = ""
+    $env:AGY_TOKEN_FILE = ""
+    $env:AGY_TOKEN_BLOB = ""
+    $env:VALID_TEAM_SECRET_BACKEND = "memory"
+    $env:VTEAM_DISABLE_HOST_ENV_REFRESH = "1"
+
+    $envPort = Get-FreeLoopbackPort
+    $envAddr = "127.0.0.1:$envPort"
+    $envBaseURL = "http://$envAddr"
+    Remove-Item -LiteralPath $envOutLog, $envErrLog -Force -ErrorAction SilentlyContinue
+    $envDaemon = Start-Process -FilePath $vteamExe -ArgumentList @("-addr", $envAddr, "-root", "`"$envWorkRoot`"", "-security", "`"$envSecFile`"") -WorkingDirectory $InstallDir -PassThru -WindowStyle Hidden -RedirectStandardOutput $envOutLog -RedirectStandardError $envErrLog
+    Wait-VteamReady $envDaemon $envBaseURL $envOutLog $envErrLog "Instance#EnvPath" | Out-Null
+
+    $sysHtml1 = Invoke-WebRequest -Uri "${envBaseURL}/settings/system" -UseBasicParsing -TimeoutSec 10
+    $setupHtml1 = Invoke-WebRequest -Uri "${envBaseURL}/setup" -UseBasicParsing -TimeoutSec 10
+    $sysTxt1 = [string]$sysHtml1.Content
+    $setupTxt1 = [string]$setupHtml1.Content
+
+    if ($sysTxt1 -notmatch 'class="cli-tool-row is-ready"[^>]*data-cli-name="codex"') {
+      throw "CODEX_HOME Chinese+Space assertion failed: codex was not detected as is-ready when default .codex is absent"
+    }
+    $agyBlockMatch = [regex]::Match($sysTxt1, '<div class="cli-tool-row[^"]*" data-cli-name="agy">[\s\S]*?</div>\s*</div>')
+    if (-not $agyBlockMatch.Success) {
+      throw "Non-PATH agy assertion failed: agy row not found on /settings/system"
+    }
+    if ($agyBlockMatch.Value -match '<span class="tag tag-quiet">未安装</span>') {
+      throw "Non-PATH agy assertion failed: agy in XDG_BIN_HOME ($envNonPathBin) was reported as 未安装"
+    }
+    foreach ($pair in @(@{ name = "/settings/system(with-agy)"; txt = $sysTxt1 }, @{ name = "/setup(with-agy)"; txt = $setupTxt1 })) {
+      if ($pair.txt -match 'which\s+agy') { throw "$($pair.name) leaked Unix 'which agy' hint on Windows" }
+      if ($pair.txt -match '未安装\s+未安装' -or $pair.txt -match '<span class="cli-tool-status-hint">\s*未安装\s*</span>') {
+        throw "$($pair.name) rendered duplicate '未安装 未安装' copy"
+      }
+    }
+
+    # Remove agy.cmd & trigger refresh_cli so Windows missing-agy hint path is exercised live
+    Remove-Item -LiteralPath (Join-Path $envNonPathBin "agy.cmd") -Force
+    & curl.exe -fsS -o NUL -X POST -H "Origin: ${envBaseURL}" "${envBaseURL}/settings/models" -d "action=refresh_cli&from_page=system"
+    if ($LASTEXITCODE -ne 0) { throw "POST /settings/models action=refresh_cli failed (exit=$LASTEXITCODE)" }
+    $sysTxt2 = [string](Invoke-WebRequest -Uri "${envBaseURL}/settings/system" -UseBasicParsing -TimeoutSec 10).Content
+    $setupTxt2 = [string](Invoke-WebRequest -Uri "${envBaseURL}/setup" -UseBasicParsing -TimeoutSec 10).Content
+    foreach ($pair in @(@{ name = "/settings/system(no-agy)"; txt = $sysTxt2 }, @{ name = "/setup(no-agy)"; txt = $setupTxt2 })) {
+      if ($pair.txt -match 'which\s+agy') { throw "$($pair.name) leaked Unix 'which agy' hint when agy is missing" }
+      if ($pair.txt -match '未安装\s+未安装' -or $pair.txt -match '<span class="cli-tool-status-hint">\s*未安装\s*</span>') {
+        throw "$($pair.name) rendered duplicate '未安装 未安装' copy when agy is missing"
+      }
+      if ($pair.txt -notmatch '未在本机检测到可执行文件') {
+        throw "$($pair.name) missing humanized CLI uninstalled guidance copy"
+      }
+      $missingAgyMatch = [regex]::Match($pair.txt, '<div class="cli-tool-row[^"]*" data-cli-name="agy"[^>]*>[\s\S]*?</div>\s*</div>')
+      if (-not $missingAgyMatch.Success -or ($missingAgyMatch.Value -notmatch 'where\.exe\s+agy')) {
+        throw "$($pair.name) missing Windows-specific 'where.exe agy' hint on agy row"
+      }
+    }
+    Write-Host "   [PASS] Win-E2E 3.8/6: CODEX_HOME (Chinese+Space, 0 ~/.codex) + non-PATH agy + 0 'which agy' + 'where.exe agy' + 0 duplicate '未安装' passed!"
+  } finally {
+    if ($envDaemon -and -not $envDaemon.HasExited) {
+      & "$env:SystemRoot\System32\taskkill.exe" /T /F /PID $envDaemon.Id 2>$null | Out-Null
+      $envDaemon.WaitForExit(5000) | Out-Null
+    }
+    foreach ($ek in $envKeysToSave) {
+      [Environment]::SetEnvironmentVariable($ek, $savedEnvMap[$ek], "Process")
+    }
+    Remove-Item -LiteralPath $envOutLog, $envErrLog -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $envE2ERoot) { Remove-DirectoryWithRetry $envE2ERoot 10 }
   }
 
   # Stage 4/6: Portable vteam.exe + subst Cross-Drive Workspace + broken-isolated Data Protection Mode
@@ -476,6 +902,54 @@ try {
   if (-not $clearedNull) { throw "Edge UI Check 3 draft clear failed: localStorage key was not removed" }
   Assert-ZeroHorizontalOverflow "role-chat(win-team-中文)"
   Write-Host "   [PASS] Edge UI Check 3 (role chat): draft save/badge/reload/clear + 1440x900 & 375x812 zero overflow verified"
+
+  # UI Check 3b: Global network proxy save, credential redaction (zero plaintext leak) & restore to default
+  $proxySaveRaw = & curl.exe -fsS -X POST `
+    -H "Origin: ${baseURL}" `
+    -H "X-Requested-With: XMLHttpRequest" `
+    "${baseURL}/settings/proxy" `
+    --data-urlencode "mode=custom" `
+    --data-urlencode "proxy_url=http://winuser:WinProxySecret99@127.0.0.1:18899" `
+    --data-urlencode "no_proxy=localhost,127.0.0.1"
+  $proxySaveObj = $proxySaveRaw | ConvertFrom-Json
+  if (-not $proxySaveObj.ok) {
+    throw "Edge UI Check 3b: POST /settings/proxy (custom) did not return ok=true: $proxySaveRaw"
+  }
+  try {
+    Navigate-CdpAndWait "${baseURL}/settings/system#sys-proxy"
+    $proxyCheckJson = Invoke-CdpEval @'
+(function(){
+  var card = document.querySelector('#sys-network-proxy-card');
+  var urlInput = document.querySelector('#sys-network-proxy-form input[name="proxy_url"]');
+  var html = document.documentElement ? document.documentElement.outerHTML : '';
+  var inputs = Array.from(document.querySelectorAll('input,textarea'));
+  var leakedInput = inputs.some(function(el){ return String(el.value || '').indexOf('WinProxySecret99') !== -1; });
+  return JSON.stringify({
+    hasCard: !!card,
+    inputVal: urlInput ? String(urlInput.value || '') : '',
+    hasHostPort: !!(urlInput && String(urlInput.value || '').indexOf('127.0.0.1:18899') !== -1),
+    leakedHtml: html.indexOf('WinProxySecret99') !== -1,
+    leakedInput: leakedInput
+  });
+})()
+'@
+    $proxyCheck = $proxyCheckJson | ConvertFrom-Json
+    if (-not $proxyCheck.hasCard -or -not $proxyCheck.hasHostPort -or $proxyCheck.leakedHtml -or $proxyCheck.leakedInput) {
+      throw "Edge UI Check 3b (/settings/system#sys-proxy) failed: hasCard=$($proxyCheck.hasCard) hasHostPort=$($proxyCheck.hasHostPort) inputVal='$($proxyCheck.inputVal)' leakedHtml=$($proxyCheck.leakedHtml) leakedInput=$($proxyCheck.leakedInput)"
+    }
+    Assert-ZeroHorizontalOverflow "system-settings(proxy)"
+    Write-Host "   [PASS] Edge UI Check 3b (/settings/system#sys-proxy): masked proxy host:port rendered, zero plaintext password leak & dual-viewport zero overflow verified"
+  } finally {
+    $proxyResetRaw = & curl.exe -fsS -X POST `
+      -H "Origin: ${baseURL}" `
+      -H "X-Requested-With: XMLHttpRequest" `
+      "${baseURL}/settings/proxy" `
+      --data-urlencode "mode=default"
+    $proxyResetObj = $proxyResetRaw | ConvertFrom-Json
+    if (-not $proxyResetObj.ok) {
+      throw "Edge UI Check 3b: POST /settings/proxy (default restore) failed: $proxyResetRaw"
+    }
+  }
 
   # UI Check 4: Instance #2 Data Protection Mode page & dual-viewport zero overflow
   if ($baseURL2) {
