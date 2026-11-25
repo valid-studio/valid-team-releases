@@ -430,7 +430,13 @@ foreach ($testBin in @("core-platform.test.exe", "vteam-statedb.test.exe", "wind
     New-Item -ItemType Directory -Force -Path $tWork | Out-Null
     Push-Location $tWork
     try {
-      & $binPath "-test.short"
+      $testArgs = @("-test.short")
+      if ($testBin -eq "va-llm.test.exe") {
+        # Source-only static *.go scan already verified in private-repo full gate;
+        # public Clean VM intentionally runs with zero private Go source files.
+        $testArgs += "-test.skip=^TestCLISyncNoStaleLegacyConstantsInProductionSource$"
+      }
+      & $binPath @testArgs
       if ($LASTEXITCODE -ne 0) { throw "Native Windows unit test binary $testBin failed with exit code $LASTEXITCODE" }
       Write-Host "   [PASS] $testBin passed on real Windows NTFS!"
     } finally {
