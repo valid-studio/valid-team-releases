@@ -89,9 +89,21 @@ $httpJob = Start-Job -ArgumentList $httpPort, $cmdNonce, $fetchNonce, $browserNo
   $listener.Start()
   $enc = [System.Text.UTF8Encoding]::new($false)
   try {
+    $ar = $null
     while ($listener.IsListening) {
-      try { $ctx = $listener.GetContext() } catch { break }
+      if ($null -eq $ar) {
+        try { $ar = $listener.BeginGetContext($null, $null) } catch { break }
+      }
+      if (-not $ar.AsyncWaitHandle.WaitOne(150)) { continue }
+      try { $ctx = $listener.EndGetContext($ar) } catch { break } finally { $ar = $null }
       $path = $ctx.Request.Url.AbsolutePath
+      if ($path -eq "/__shutdown") {
+        $bye = $enc.GetBytes("BYE")
+        $ctx.Response.ContentLength64 = $bye.Length
+        $ctx.Response.OutputStream.Write($bye, 0, $bye.Length)
+        $ctx.Response.OutputStream.Close()
+        break
+      }
       [System.IO.File]::AppendAllText($logFile, ($path + "`n"), $enc)
       if ($path -eq "/health") {
         $body = "OK"
@@ -298,6 +310,8 @@ exit 17
     Invoke-RestMethod -Uri "$BaseURL/projects/$encProj/browser/stop" -Method Post -Headers @{ "Origin" = $BaseURL; "Sec-Fetch-Site" = "same-origin" } -TimeoutSec 5 | Out-Null
   } catch {}
   if ($httpJob) {
+    try { Invoke-RestMethod -Uri "http://127.0.0.1:$httpPort/__shutdown" -TimeoutSec 2 -ErrorAction SilentlyContinue | Out-Null } catch {}
+    try { Wait-Job -Job $httpJob -Timeout 3 -ErrorAction SilentlyContinue | Out-Null } catch {}
     try { Stop-Job -Job $httpJob -ErrorAction SilentlyContinue } catch {}
     try { Remove-Job -Job $httpJob -Force -ErrorAction SilentlyContinue } catch {}
   }

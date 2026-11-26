@@ -398,35 +398,94 @@ S(("127.0.0.1", a.port), H).serve_forever()
   }
 }
 
-Write-Host "==> [Win-E2E 1/6] Running stripped native Windows Go unit test binaries..."
+Write-Host "==> [Win-E2E 1/6] Running stripped native Windows Go unit test binaries (parallel isolated workdirs)..."
 $requireWinTestBins = ($env:VTEAM_REQUIRE_WIN_TEST_BINS -eq "1") -or (@(Get-ChildItem -Path $DownloadDir -Filter "*.test.exe" -ErrorAction SilentlyContinue).Count -gt 0)
-foreach ($testBin in @("core-platform.test.exe", "vteam-statedb.test.exe", "windows-app.test.exe", "va-sdk.test.exe", "va-llm.test.exe")) {
-  $binPath = Join-Path $DownloadDir $testBin
-  if (Test-Path -LiteralPath $binPath) {
-    if ((Get-Item -LiteralPath $binPath).Length -le 0) {
-      throw "Required native Windows unit test binary is empty (0 bytes): $binPath"
-    }
-    Write-Host "   -> Executing $testBin on real Windows NTFS (clean empty workdir)..."
-    $tWork = Join-Path $env:RUNNER_TEMP ("ut-" + $testBin)
-    if (Test-Path -LiteralPath $tWork) { Remove-Item -LiteralPath $tWork -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $tWork | Out-Null
-    Push-Location $tWork
-    try {
+$winTestJobs = @()
+try {
+  $winTestSw = [System.Diagnostics.Stopwatch]::StartNew()
+  foreach ($testBin in @("core-platform.test.exe", "vteam-statedb.test.exe", "windows-app.test.exe", "va-sdk.test.exe", "va-llm.test.exe")) {
+    $binPath = Join-Path $DownloadDir $testBin
+    if (Test-Path -LiteralPath $binPath) {
+      if ((Get-Item -LiteralPath $binPath).Length -le 0) {
+        throw "Required native Windows unit test binary is empty (0 bytes): $binPath"
+      }
+      $tWork = Join-Path $env:RUNNER_TEMP ("ut-" + $testBin)
+      if (Test-Path -LiteralPath $tWork) { Remove-Item -LiteralPath $tWork -Recurse -Force }
+      New-Item -ItemType Directory -Force -Path $tWork | Out-Null
+      $tOut = Join-Path $tWork "stdout.log"
+      $tErr = Join-Path $tWork "stderr.log"
       $testArgs = @("-test.short")
       if ($testBin -eq "va-llm.test.exe") {
         # Source-only static *.go scan already verified in private-repo full gate;
         # public Clean VM intentionally runs with zero private Go source files.
         $testArgs += "-test.skip=^TestCLISyncNoStaleLegacyConstantsInProductionSource$"
       }
-      & $binPath @testArgs
-      if ($LASTEXITCODE -ne 0) { throw "Native Windows unit test binary $testBin failed with exit code $LASTEXITCODE" }
-      Write-Host "   [PASS] $testBin passed on real Windows NTFS!"
-    } finally {
-      Pop-Location
-      Remove-Item -LiteralPath $tWork -Recurse -Force -ErrorAction SilentlyContinue
+      Write-Host "   -> Launching $testBin in parallel on real Windows NTFS (clean empty workdir)..."
+      $proc = Start-Process -FilePath $binPath -ArgumentList $testArgs -WorkingDirectory $tWork -PassThru -WindowStyle Hidden -RedirectStandardOutput $tOut -RedirectStandardError $tErr
+      $winTestJobs += [pscustomobject]@{
+        Name    = $testBin
+        Proc    = $proc
+        WorkDir = $tWork
+        OutFile = $tOut
+        ErrFile = $tErr
+        Started = [System.Diagnostics.Stopwatch]::StartNew()
+        Elapsed = $null
+      }
+    } elseif ($requireWinTestBins) {
+      throw "Required native Windows unit test binary missing: $binPath"
     }
-  } elseif ($requireWinTestBins) {
-    throw "Required native Windows unit test binary missing: $binPath"
+  }
+
+  if ($winTestJobs.Count -gt 0) {
+    $deadline = (Get-Date).AddMinutes(10)
+    while ($true) {
+      $pending = 0
+      foreach ($job in $winTestJobs) {
+        if ($job.Proc.HasExited) {
+          if ($null -eq $job.Elapsed) {
+            $job.Started.Stop()
+            $job.Elapsed = [math]::Round($job.Started.Elapsed.TotalSeconds, 1)
+          }
+        } else {
+          $pending++
+        }
+      }
+      if ($pending -eq 0) { break }
+      if ((Get-Date) -gt $deadline) {
+        $stuck = @($winTestJobs | Where-Object { -not $_.Proc.HasExited } | ForEach-Object { $_.Name }) -join ", "
+        throw "Native Windows unit test binaries timed out after 10m: $stuck"
+      }
+      Start-Sleep -Milliseconds 200
+    }
+    $winTestSw.Stop()
+    $failedBins = @()
+    foreach ($job in $winTestJobs) {
+      $job.Proc.WaitForExit()
+      $rc = $job.Proc.ExitCode
+      $oTxt = if (Test-Path -LiteralPath $job.OutFile) { Get-Content -LiteralPath $job.OutFile -Raw -ErrorAction SilentlyContinue } else { "" }
+      $eTxt = if (Test-Path -LiteralPath $job.ErrFile) { Get-Content -LiteralPath $job.ErrFile -Raw -ErrorAction SilentlyContinue } else { "" }
+      if ($rc -ne 0) {
+        Write-Host "   [FAIL] $($job.Name) exited with code $rc ($($job.Elapsed)s)"
+        if (-not [string]::IsNullOrWhiteSpace($oTxt)) { Write-Host $oTxt.TrimEnd() }
+        if (-not [string]::IsNullOrWhiteSpace($eTxt)) { Write-Host $eTxt.TrimEnd() }
+        $failedBins += "$($job.Name)(exit=$rc)"
+      } else {
+        if (-not [string]::IsNullOrWhiteSpace($oTxt)) { Write-Host ("   [{0}] {1}" -f $job.Name, $oTxt.Trim()) }
+        Write-Host "   [PASS] $($job.Name) passed on real Windows NTFS ($($job.Elapsed)s)!"
+      }
+    }
+    if ($failedBins.Count -gt 0) {
+      throw "Native Windows unit test binary failure(s): $($failedBins -join ', ')"
+    }
+    Write-Host ("   [PASS] All {0} native Windows unit test binaries passed in parallel ({1}s wall time)!" -f $winTestJobs.Count, ([math]::Round($winTestSw.Elapsed.TotalSeconds, 1)))
+  }
+} finally {
+  foreach ($job in $winTestJobs) {
+    if ($job.Proc -and -not $job.Proc.HasExited) {
+      & "$env:SystemRoot\System32\taskkill.exe" /T /F /PID $job.Proc.Id 2>$null | Out-Null
+      $job.Proc.WaitForExit(3000) | Out-Null
+    }
+    Remove-DirectoryWithRetry $job.WorkDir 8
   }
 }
 

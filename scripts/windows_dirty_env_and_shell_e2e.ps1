@@ -53,6 +53,7 @@ $dirtySec = Join-Path $dirtyRoot "security.toml"
 $outLog = Join-Path $env:RUNNER_TEMP "win-dirty-vteam-out-$runId.log"
 $errLog = Join-Path $env:RUNNER_TEMP "win-dirty-vteam-err-$runId.log"
 $proxyHitLog = Join-Path $env:RUNNER_TEMP "win-dirty-proxy-hits-$runId.log"
+$proxyStopFlag = Join-Path $env:RUNNER_TEMP "win-dirty-proxy-stop-$runId.flag"
 $proxyPass = "VtProxyPass99!"; $proxyUser = "vtuser"
 $proxyB64 = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${proxyUser}:${proxyPass}"))
 
@@ -104,13 +105,14 @@ try {
 
   # Start real authenticating HTTP/CONNECT tunneling proxy BEFORE launching $daemon2 so $daemon2 inherits mixed-case proxy env!
   $proxyPort = Get-FreeLoopbackPort
-  Remove-Item -LiteralPath $proxyHitLog -Force -ErrorAction SilentlyContinue
-  $proxyJob = Start-Job -ArgumentList $proxyPort, $proxyB64, $proxyHitLog -ScriptBlock {
-    param($port, $expectedB64, $hitLog)
+  Remove-Item -LiteralPath $proxyHitLog, $proxyStopFlag -Force -ErrorAction SilentlyContinue
+  $proxyJob = Start-Job -ArgumentList $proxyPort, $proxyB64, $proxyHitLog, $proxyStopFlag -ScriptBlock {
+    param($port, $expectedB64, $hitLog, $stopFlag)
     $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port); $tcp.Start()
     $enc = [System.Text.UTF8Encoding]::new($false)
     try {
-      while ($true) {
+      while (-not (Test-Path -LiteralPath $stopFlag)) {
+        if (-not $tcp.Pending()) { Start-Sleep -Milliseconds 100; continue }
         $client = $tcp.AcceptTcpClient()
         try {
           $stream = $client.GetStream(); $stream.ReadTimeout = 5000
@@ -337,11 +339,15 @@ public static class VtShellProbe {
   if ($guiProc -and -not $guiProc.HasExited) { Stop-ProcessTree $guiProc.Id; $guiProc.WaitForExit(5000) | Out-Null }
   if ($daemon2 -and -not $daemon2.HasExited) { Stop-ProcessTree $daemon2.Id; $daemon2.WaitForExit(5000) | Out-Null }
   if ($daemon1 -and -not $daemon1.HasExited) { Stop-ProcessTree $daemon1.Id; $daemon1.WaitForExit(5000) | Out-Null }
-  if ($proxyJob) { try { Stop-Job $proxyJob -ErrorAction SilentlyContinue; Remove-Job $proxyJob -Force -ErrorAction SilentlyContinue } catch {} }
+  if ($proxyJob) {
+    try { if ($proxyStopFlag) { Set-Content -LiteralPath $proxyStopFlag -Value "1" -Encoding ASCII -ErrorAction SilentlyContinue } } catch {}
+    try { Wait-Job -Job $proxyJob -Timeout 3 -ErrorAction SilentlyContinue | Out-Null } catch {}
+    try { Stop-Job $proxyJob -ErrorAction SilentlyContinue; Remove-Job $proxyJob -Force -ErrorAction SilentlyContinue } catch {}
+  }
   $uninst = Join-Path $dirtyInstall "unins000.exe"
   if (Test-Path -LiteralPath $uninst) { try { Start-Process -FilePath $uninst -ArgumentList @("/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART") -Wait -PassThru | Out-Null } catch {} }
   foreach ($k in $envKeys) { [System.Environment]::SetEnvironmentVariable($k, $savedEnv[$k], "Process") }
-  Remove-Item -LiteralPath $outLog, $errLog, $proxyHitLog -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $outLog, $errLog, $proxyHitLog, $proxyStopFlag -Force -ErrorAction SilentlyContinue
   Remove-DirRetry $dirtyRoot 14
   if (Test-Path -LiteralPath $dirtyRoot) { throw "Lingering NTFS file handle prevented removal of dirty env root: $dirtyRoot" }
 }
