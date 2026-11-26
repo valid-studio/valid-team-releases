@@ -5,27 +5,18 @@ param(
   [string]$DownloadDir = (Join-Path $env:RUNNER_TEMP "vt-win"),
   [string]$PortableDir = "",
   [string]$ReleaseRepo = "",
-  [string]$TargetTag = ""
+  [string]$TargetTag = "",
+  [switch]$AllowOfflineSkipRealLLM
 )
-
 $ErrorActionPreference = "Stop"
-
 function Write-Utf8NoBom([string]$TargetPath, [string]$Text) {
-  $parent = Split-Path -Parent $TargetPath
-  if ($parent -and -not (Test-Path -LiteralPath $parent)) {
-    New-Item -ItemType Directory -Force -Path $parent | Out-Null
-  }
+  $p = Split-Path -Parent $TargetPath; if ($p -and -not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
   [System.IO.File]::WriteAllBytes($TargetPath, [System.Text.UTF8Encoding]::new($false).GetBytes($Text))
 }
-
 function Get-FreeLoopbackPort {
-  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-  $listener.Start()
-  $p = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
-  $listener.Stop()
-  return $p
+  $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $l.Start()
+  try { return ([System.Net.IPEndPoint]$l.LocalEndpoint).Port } finally { $l.Stop() }
 }
-
 function Read-RedactedLog([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) { return "<empty>" }
   try {
@@ -33,30 +24,21 @@ function Read-RedactedLog([string]$Path) {
     $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8, $true)
     try { $txt = $sr.ReadToEnd() } finally { $sr.Dispose(); $fs.Dispose() }
     if ([string]::IsNullOrWhiteSpace($txt)) { return "<empty>" }
-    if (-not [string]::IsNullOrWhiteSpace($env:VTEAM_TEST_API_KEY)) {
-      $txt = $txt.Replace($env:VTEAM_TEST_API_KEY, "[REDACTED]")
-    }
+    if (-not [string]::IsNullOrWhiteSpace($env:VTEAM_TEST_API_KEY)) { $txt = $txt.Replace($env:VTEAM_TEST_API_KEY, "[REDACTED]") }
     return $txt.Trim()
-  } catch {
-    return "<unreadable: $($_.Exception.Message)>"
-  }
+  } catch { return "<unreadable: $($_.Exception.Message)>" }
 }
-
 function Wait-VteamReady([System.Diagnostics.Process]$Proc, [string]$BaseURL, [string]$OutLog, [string]$ErrLog, [string]$Label) {
   for ($i = 0; $i -lt 80; $i++) {
     if ($Proc.HasExited) { break }
-    try {
-      $resp = Invoke-RestMethod -Uri "$BaseURL/api/status" -Method Get -TimeoutSec 2
-      if (-not $resp.bootstrapping) { return $resp }
-    } catch {}
+    try { $resp = Invoke-RestMethod -Uri "$BaseURL/api/status" -Method Get -TimeoutSec 2; if (-not $resp.bootstrapping) { return $resp } } catch {}
     Start-Sleep -Milliseconds 250
   }
   $exitInfo = if ($Proc.HasExited) { "exited early with code $($Proc.ExitCode)" } else { "did not finish bootstrap within 20s" }
   throw "$Label vteam.exe $exitInfo (stdout: $(Read-RedactedLog $OutLog) | stderr: $(Read-RedactedLog $ErrLog))"
 }
-
 function Remove-DirectoryWithRetry([string]$DirPath, [int]$MaxAttempts = 10) {
-  for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+  for ($a = 1; $a -le $MaxAttempts; $a++) {
     if (-not (Test-Path -LiteralPath $DirPath)) { return }
     Remove-Item -LiteralPath $DirPath -Recurse -Force -ErrorAction SilentlyContinue
     if (-not (Test-Path -LiteralPath $DirPath)) { return }
@@ -547,6 +529,11 @@ try {
       $safeHdr = if (Test-Path -LiteralPath $setupHdr) { (Get-Content -LiteralPath $setupHdr -Raw).Replace($env:VTEAM_TEST_API_KEY, "[REDACTED]") } else { "<no headers>" }
       throw "POST /setup failed after 4 attempts ($apiName/$apiModel): $safeHdr"
     }
+    $realLlmScript = Join-Path $PSScriptRoot "windows_real_llm_e2e.ps1"
+    if (-not (Test-Path -LiteralPath $realLlmScript)) { throw "Missing required modular script: $realLlmScript" }
+    & $realLlmScript -BaseURL $baseURL -WorkspaceRoot $e2eRoot -InstallDir $InstallDir -Model "$apiName/$apiModel"
+  } elseif ($env:CI -eq "true" -or -not $AllowOfflineSkipRealLLM) {
+    throw "VTEAM_TEST_API_KEY is required for Windows real-LLM E2E (CI=true forbids silent skip)"
   }
 
   # Stage 3.8/6: Cross-OS Env & Path Real Windows Assertions (CODEX_HOME Chinese+Space & Non-PATH agy & Zero Unix which/Duplicate Copy)
@@ -1051,4 +1038,9 @@ try {
 
 Remove-DirectoryWithRetry $e2eRoot 10
 if (Test-Path -LiteralPath $e2eRoot) { throw "Lingering Windows file handle prevented removal of $e2eRoot" }
-Write-Host "✅ WIN_REAL_E2E_OK: 4x Native Go Test Bins + Legacy Migration + Portable/Subst/Protection + Edge Headless UI + Clean Teardown passed!"
+$dirtyShellScript = Join-Path $PSScriptRoot "windows_dirty_env_and_shell_e2e.ps1"
+$setupExePath = Join-Path $DownloadDir "ValidTeam-Setup.exe"
+if (-not (Test-Path -LiteralPath $dirtyShellScript)) { throw "Missing required modular script: $dirtyShellScript" }
+if (-not (Test-Path -LiteralPath $setupExePath)) { throw "Missing required installer for dirty-env E2E: $setupExePath" }
+& $dirtyShellScript -SetupExe $setupExePath -DownloadDir $DownloadDir
+Write-Host "✅ WIN_REAL_E2E_OK: Native Test Bins + Real-LLM 4-Tools + Legacy/Portable/Subst/Edge UI + Dirty-Env/CP936/Proxy/Shell DPI+Icon passed!"

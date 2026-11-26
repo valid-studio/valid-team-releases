@@ -136,18 +136,16 @@ jobs:
           path: test-artifacts/
 
   windows-native-smoke:
-    name: "Windows x64 Real E2E (Checksum · Silent Install · --ci-selftest · NTFS SQLite & Unit Tests)"
+    name: "Windows x64 Real E2E (Checksum · Silent Install · Real-LLM Tools · Dirty Env · Shell DPI/Icon)"
     runs-on: windows-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
+    timeout-minutes: 35
     steps:
       - name: 1. Checkout Public E2E Verification Harness (Zero App Source Code)
         uses: actions/checkout@v4
         with:
           ref: main
 
-      - name: 2. Download Windows Assets, Enforce Prerelease Test Bins & Package Setup.exe if Needed
+      - name: 2. Download Pre-Built Windows Assets & Enforce SHA256 + Prerelease Test Bins
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_TAG: ${{ github.event.release.tag_name || inputs.release_tag || 'latest' }}
@@ -167,8 +165,11 @@ jobs:
               if ($LASTEXITCODE -ne 0 -or -not $relMeta) { throw "Failed to inspect release metadata for $env:TARGET_TAG" }
               $isPrerelease = [bool]$relMeta.isPrerelease
               $remoteAssets = @($relMeta.assets | ForEach-Object { $_.name })
-              gh release download "$env:TARGET_TAG" --repo "$env:GITHUB_REPOSITORY" -p "ValidTeam-windows-amd64.zip" -p "SHA256SUMS-windows.txt" -p "latest-windows.json" --clobber
-              if ($LASTEXITCODE -ne 0) { throw "Failed to download Windows portable assets for $env:TARGET_TAG" }
+              if ($remoteAssets -notcontains "ValidTeam-Setup.exe") {
+                throw "Missing pre-built ValidTeam-Setup.exe on release $env:TARGET_TAG (public-repo packaging is permanently abolished)"
+              }
+              gh release download "$env:TARGET_TAG" --repo "$env:GITHUB_REPOSITORY" -p "ValidTeam-Setup.exe" -p "ValidTeam-windows-amd64.zip" -p "SHA256SUMS-windows.txt" -p "latest-windows.json" --clobber
+              if ($LASTEXITCODE -ne 0) { throw "Failed to download Windows release assets for $env:TARGET_TAG" }
               if ($isPrerelease) {
                 gh release download "$env:TARGET_TAG" --repo "$env:GITHUB_REPOSITORY" -p "*.test.exe" --clobber
                 if ($LASTEXITCODE -ne 0) { throw "Failed to download required *.test.exe on prerelease $env:TARGET_TAG" }
@@ -177,46 +178,10 @@ jobs:
                 }
                 "VTEAM_REQUIRE_WIN_TEST_BINS=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
               }
-              if ($remoteAssets -contains "ValidTeam-Setup.exe") {
-                gh release download "$env:TARGET_TAG" --repo "$env:GITHUB_REPOSITORY" -p "ValidTeam-Setup.exe" --clobber
-                if ($LASTEXITCODE -ne 0) { throw "Failed to download ValidTeam-Setup.exe for $env:TARGET_TAG" }
-              } else {
-                if (-not $isPrerelease) { throw "Missing ValidTeam-Setup.exe on non-prerelease tag $env:TARGET_TAG" }
-                $winMeta = Get-Content -LiteralPath "latest-windows.json" -Raw | ConvertFrom-Json
-                $stageRoot = Join-Path $env:RUNNER_TEMP "vt-win-iscc-stage"
-                if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
-                Expand-Archive -LiteralPath (Join-Path $dlDir "ValidTeam-windows-amd64.zip") -DestinationPath $stageRoot -Force
-                $stageSrc = Join-Path $stageRoot "ValidTeam"
-                foreach ($reqPay in @("ValidTeam.exe", "vteam.exe", "va.exe", "README.txt")) {
-                  $pFile = Join-Path $stageSrc $reqPay
-                  if (-not (Test-Path -LiteralPath $pFile) -or (Get-Item -LiteralPath $pFile).Length -le 0) { throw "Portable ZIP missing or empty payload: $pFile" }
-                }
-                $isccPath = $env:ISCC_EXE
-                if ([string]::IsNullOrWhiteSpace($isccPath)) { $cmd = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue; if ($cmd) { $isccPath = $cmd.Source } }
-                $isccCands = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "${env:ProgramFiles}\Inno Setup 6\ISCC.exe", "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe", "C:\ProgramData\chocolatey\bin\ISCC.exe")
-                if ([string]::IsNullOrWhiteSpace($isccPath)) { foreach ($cand in $isccCands) { if ($cand -and (Test-Path -LiteralPath $cand)) { $isccPath = $cand; break } } }
-                if ([string]::IsNullOrWhiteSpace($isccPath) -and (Get-Command "choco" -ErrorAction SilentlyContinue)) {
-                  & choco install innosetup -y --no-progress | Out-Null
-                  foreach ($cand in $isccCands) { if ($cand -and (Test-Path -LiteralPath $cand)) { $isccPath = $cand; break } }
-                }
-                if ([string]::IsNullOrWhiteSpace($isccPath) -or -not (Test-Path -LiteralPath $isccPath)) { throw "Inno Setup compiler (ISCC.exe) not found" }
-                $issFile = Join-Path $env:GITHUB_WORKSPACE "packaging\windows\installer.iss"
-                if (-not (Test-Path -LiteralPath $issFile)) { throw "Missing public packaging script: $issFile" }
-                & $isccPath "/DMyAppVersion=$($winMeta.version)" "/DMyBuildNumber=$($winMeta.build)" "/DSourceDir=$stageSrc" "/DOutputDir=$dlDir" $issFile
-                if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "ValidTeam-Setup.exe") -or (Get-Item -LiteralPath "ValidTeam-Setup.exe").Length -le 0) { throw "ISCC.exe failed to produce ValidTeam-Setup.exe (exit=$LASTEXITCODE)" }
-                Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
-                $setupHash = (Get-FileHash -LiteralPath "ValidTeam-Setup.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-                $zipHash = (Get-FileHash -LiteralPath "ValidTeam-windows-amd64.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-                $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                [System.IO.File]::WriteAllText((Join-Path $dlDir "SHA256SUMS-windows.txt"), ("$setupHash  ValidTeam-Setup.exe`n$zipHash  ValidTeam-windows-amd64.zip`n"), $utf8NoBom)
-                $winMeta.setup_sha256 = $setupHash
-                $winMeta.setup_size = [int64](Get-Item -LiteralPath "ValidTeam-Setup.exe").Length
-                $winMeta.zip_sha256 = $zipHash
-                $winMeta.zip_size = [int64](Get-Item -LiteralPath "ValidTeam-windows-amd64.zip").Length
-                $winMeta.sha256 = $zipHash
-                [System.IO.File]::WriteAllText((Join-Path $dlDir "latest-windows.json"), (($winMeta | ConvertTo-Json -Depth 4) + "`n"), $utf8NoBom)
-                gh release upload "$env:TARGET_TAG" --repo "$env:GITHUB_REPOSITORY" "ValidTeam-Setup.exe" "SHA256SUMS-windows.txt" "latest-windows.json" --clobber
-                if ($LASTEXITCODE -ne 0) { throw "Failed to upload packaged ValidTeam-Setup.exe to prerelease $env:TARGET_TAG" }
+            }
+            foreach ($reqAsset in @("ValidTeam-Setup.exe", "ValidTeam-windows-amd64.zip", "SHA256SUMS-windows.txt", "latest-windows.json")) {
+              if (-not (Test-Path -LiteralPath $reqAsset) -or (Get-Item -LiteralPath $reqAsset).Length -le 0) {
+                throw "Missing or empty required Windows release asset: $reqAsset"
               }
             }
             Get-Content SHA256SUMS-windows.txt
@@ -247,8 +212,9 @@ jobs:
             Pop-Location
           }
 
-      - name: 3. Silent Install ValidTeam-Setup.exe, --ci-selftest, Real Clean-VM OTA & NTFS SQLite E2E
+      - name: 3. Silent Install ValidTeam-Setup.exe, --ci-selftest, Real-LLM Tools, Dirty Env, Shell DPI/Icon & Clean-VM OTA E2E
         env:
+          CI: "true"
           GH_TOKEN: ${{ github.token }}
           TARGET_TAG: ${{ github.event.release.tag_name || inputs.release_tag || 'latest' }}
           VTEAM_TEST_API_KEY: ${{ secrets.VTEAM_TEST_API_KEY }}
@@ -259,6 +225,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          if ($env:CI -eq "true" -and [string]::IsNullOrWhiteSpace($env:VTEAM_TEST_API_KEY)) {
+            throw "CI=true requires VTEAM_TEST_API_KEY secret for Windows real-LLM E2E (silent skip is strictly forbidden)"
+          }
           $dlDir = Join-Path $env:RUNNER_TEMP "vt-win"
           $setupExe = Join-Path $dlDir "ValidTeam-Setup.exe"
           $proc = Start-Process -FilePath $setupExe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
@@ -297,10 +266,12 @@ jobs:
           if (-not $portVteam) { throw "Portable ZIP missing vteam.exe" }
           & $portVteam.FullName --version
 
-          # Run real Clean-VM OTA (PREV_TAG != TARGET_TAG) + NTFS SQLite + Unit Tests + Edge UI + Portable/Subst/Legacy E2E (required, never silently skip)
+          # Run real Clean-VM OTA + NTFS SQLite + Real-LLM Tools + Dirty Env + Shell DPI/Icon E2E (all modular scripts required)
           $winRealE2E = "./scripts/windows_real_e2e.ps1"
-          if (-not (Test-Path -LiteralPath $winRealE2E) -or (Get-Item -LiteralPath $winRealE2E).Length -le 0) {
-            throw "Missing or empty required Windows E2E script: $winRealE2E"
+          foreach ($reqScript in @($winRealE2E, "./scripts/windows_real_llm_e2e.ps1", "./scripts/windows_dirty_env_and_shell_e2e.ps1")) {
+            if (-not (Test-Path -LiteralPath $reqScript) -or (Get-Item -LiteralPath $reqScript).Length -le 0) {
+              throw "Missing or empty required Windows E2E script: $reqScript"
+            }
           }
           & $winRealE2E -InstallDir $installDir -DownloadDir $dlDir -PortableDir $portDir -ReleaseRepo $env:GITHUB_REPOSITORY -TargetTag $env:TARGET_TAG
 
