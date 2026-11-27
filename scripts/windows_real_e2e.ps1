@@ -304,6 +304,8 @@ S(("127.0.0.1", a.port), H).serve_forever()
     if (-not (Test-Path -LiteralPath $otaProjToml) -or -not (Test-Path -LiteralPath $otaProjDb)) {
       throw "Clean-VM OTA Phase 1 missing $otaProjToml or $otaProjDb"
     }
+    $otaProjTomlPre = Join-Path $otaWork "project.toml.before"
+    Copy-Item -LiteralPath $otaProjToml -Destination $otaProjTomlPre -Force
     $projHashPre = (Get-FileHash -LiteralPath $otaProjToml -Algorithm SHA256).Hash
 
     $errLog = Join-Path $otaCacheDir "last-update-error.log"
@@ -373,7 +375,72 @@ S(("127.0.0.1", a.port), H).serve_forever()
       throw "Clean-VM OTA Assertion 2/3 failed: invalid upgraded process state"
     }
     if ((Get-FileHash -LiteralPath $otaSecToml -Algorithm SHA256).Hash -ne $secHashPre) { throw "Clean-VM OTA Assertion 4 failed: security.toml altered" }
-    if ((Get-FileHash -LiteralPath $otaProjToml -Algorithm SHA256).Hash -ne $projHashPre) { throw "Clean-VM OTA Assertion 4 failed: project.toml altered" }
+    if ((Get-FileHash -LiteralPath $otaProjToml -Algorithm SHA256).Hash -ne $projHashPre) {
+      $projVerifyPy = Join-Path $otaWork "verify_proj_toml_ota.py"
+      Write-Utf8NoBom $projVerifyPy @'
+import ast, pathlib, sys
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
+def parse_toml(raw):
+    if tomllib is not None:
+        return tomllib.loads(raw)
+    doc = {}
+    cur = doc
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == "[[role]]":
+            cur = {}
+            doc.setdefault("role", []).append(cur)
+            continue
+        if "=" not in line:
+            raise ValueError(f"unsupported TOML line: {line}")
+        k, v = [p.strip() for p in line.split("=", 1)]
+        if v == "true":
+            val = True
+        elif v == "false":
+            val = False
+        elif v.startswith('"') or v.startswith("["):
+            val = ast.literal_eval(v)
+        else:
+            val = v
+        cur[k] = val
+    return doc
+
+def norm(v):
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+b = parse_toml(pathlib.Path(sys.argv[1]).read_text("utf-8"))
+a = parse_toml(pathlib.Path(sys.argv[2]).read_text("utf-8"))
+if b.get("browser_skills_seeded", False) is not False or a.get("browser_skills_seeded") is not True:
+    raise SystemExit(f"unexpected project.toml mutation (seeded {b.get('browser_skills_seeded')!r} -> {a.get('browser_skills_seeded')!r})")
+b_top = {k: norm(v) for k, v in b.items() if k not in ("role", "browser_skills_seeded")}
+a_top = {k: norm(v) for k, v in a.items() if k not in ("role", "browser_skills_seeded")}
+if b_top != a_top:
+    raise SystemExit(f"project.toml top-level metadata drifted: {b_top!r} != {a_top!r}")
+b_roles, a_roles = b.get("role", []), a.get("role", [])
+if len(b_roles) != len(a_roles):
+    raise SystemExit(f"project.toml role count drifted: {len(b_roles)} != {len(a_roles)}")
+for idx, (br, ar) in enumerate(zip(b_roles, a_roles)):
+    br_o = {k: norm(v) for k, v in br.items() if k != "skills"}
+    ar_o = {k: norm(v) for k, v in ar.items() if k != "skills"}
+    if br_o != ar_o:
+        raise SystemExit(f"project.toml role[{idx}] metadata drifted")
+    bs, as_ = list(br.get("skills", [])), list(ar.get("skills", []))
+    if (set(bs) - set(as_)) or not (set(as_) - set(bs)).issubset({"\u6d4f\u89c8\u5668\u64cd\u63a7"}) or len(as_) != len(set(as_)):
+        raise SystemExit(f"project.toml role[{idx}] skills drifted: {bs!r} -> {as_!r}")
+print("    [Win-E2E] project.toml verified: exact v1.3.4 one-shot browser_skills_seeded migration (all metadata & roles preserved)")
+'@
+      $projVerifyOut = (Invoke-CleanPy $pyExe @($projVerifyPy, $otaProjTomlPre, $otaProjToml) | Out-String).Trim()
+      if ($LASTEXITCODE -ne 0) {
+        throw "Clean-VM OTA Assertion 4 failed: project.toml altered ($projVerifyOut)"
+      }
+      Write-Host $projVerifyOut
+    }
     if ((curl.exe -sS -o NUL -w "%{http_code}" "http://127.0.0.1:8787/projects/$otaProjEnc").Trim() -ne "200") {
       throw "Clean-VM OTA Assertion 4 failed: GET /projects/$otaProjEnc != 200"
     }
